@@ -286,6 +286,7 @@ def main():
     model = GPT(GPTConfig())
     model.eval()
     model.to(device)
+    model = torch.compile(model)
     # logits, loss = model(x, y)
     # print(loss)
     # print(model)
