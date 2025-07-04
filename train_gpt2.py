@@ -286,7 +286,7 @@ def main():
     torch.set_float32_matmul_precision("high")
 
     # model = GPT.from_pretrained("gpt2")
-    model = GPT(GPTConfig())
+    model = GPT(GPTConfig(vocab_size=50304))
     model.eval()
     model.to(device)
     model = torch.compile(model)
