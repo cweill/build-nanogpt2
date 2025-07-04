@@ -298,6 +298,7 @@ def main():
     torch.mps.manual_seed(1337)
     set_seed(1337)
 
+
     device = torch.device(
         "cuda"
         if torch.cuda.is_available()
@@ -305,7 +306,15 @@ def main():
     )
     print(f"Using device: {device}")
 
-    train_loader = DataLoaderLite(B=32, T=1024)
+    total_batch_size = 524_288 # 2**19, ~0.5M in number of tokens
+    B = 16 # micro batch size
+    T = 1024 # sequence length
+    assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by (B * T)"
+    grad_accum_steps = total_batch_size // (B * T)
+    print(f"total desired batch size: {total_batch_size:,}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps:,}")
+
+    train_loader = DataLoaderLite(B=B, T=T)
 
     torch.set_float32_matmul_precision("high")
 
@@ -337,14 +346,20 @@ def main():
     optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
     for step in range(50):
         t0 = time.time()
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-
-        # code.interact(local=locals())
-        loss.backward()
+        loss_accum = 0
+        for micro_step in range(grad_accum_steps):
+            x, y = train_loader.next_batch()
+            x, y = x.to(device), y.to(device)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                logits, loss = model(x, y)
+            # we have to scale the loss to account for gradient accumulation,
+            # because the gradients just add on each successive backward().
+            # addition of gradients corresponds to a SUM in the objective, but
+            # instead of a SUM we want MEAN. Scale the loss here so it comes out right.
+            loss = loss / grad_accum_steps
+            loss_accum += loss.detach()
+            loss.backward()
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         # detemine the learning rate for this step
         lr = get_lr(step)
@@ -354,9 +369,10 @@ def main():
         torch.cuda.synchronize()
         t1 = time.time()
         dt = (t1 - t0) * 1000  # ms
-        tokens_per_second = (train_loader.B * train_loader.T) / (t1 - t0)
+        tokens_processed = (train_loader.B * train_loader.T) * grad_accum_steps
+        tokens_per_second = tokens_processed / (t1 - t0)
         print(
-            f"Step {step:4d} | loss: {loss.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | time: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}"
+            f"Step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | time: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}"
         )
 
     sys.exit()
