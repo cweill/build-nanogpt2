@@ -278,9 +278,9 @@ def main():
     )
     print(f"Using device: {device}")
 
-    train_loader = DataLoaderLite(B=16, T=1024)
+    train_loader = DataLoaderLite(B=32, T=1024)
 
-    # torch.set_float32_matmul_precision("high")
+    torch.set_float32_matmul_precision("high")
 
     # model = GPT.from_pretrained("gpt2")
     model = GPT(GPTConfig())
@@ -296,8 +296,8 @@ def main():
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
-        # with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
 
         # code.interact(local=locals())
         loss.backward()
