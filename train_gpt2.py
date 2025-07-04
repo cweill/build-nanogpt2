@@ -266,10 +266,10 @@ def main():
     NUM_RETURN_SEQUENCES = 5
     MAX_LENGTH = 30
 
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-    torch.mps.manual_seed(42)
-    set_seed(42)
+    torch.manual_seed(1337)
+    torch.cuda.manual_seed(1337)
+    torch.mps.manual_seed(1337)
+    set_seed(1337)
 
     device = torch.device(
         "cuda"
@@ -296,6 +296,7 @@ def main():
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
+        # with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
         logits, loss = model(x, y)
 
         # code.interact(local=locals())
