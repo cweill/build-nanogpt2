@@ -280,6 +280,8 @@ def main():
 
     train_loader = DataLoaderLite(B=16, T=1024)
 
+    # torch.set_float32_matmul_precision("high")
+
     # model = GPT.from_pretrained("gpt2")
     model = GPT(GPTConfig())
     model.eval()
@@ -301,8 +303,11 @@ def main():
         optimizer.step()
         torch.cuda.synchronize()
         t1 = time.time()
-        dt = t1 - t0
-        print(f"Step {i}, loss: {loss.item()}, time: {dt:.2f}s")
+        dt = (t1 - t0) * 1000  # ms
+        tokens_per_second = (train_loader.B * train_loader.T) / (t1 - t0)
+        print(
+            f"Step {i}, loss: {loss.item()}, time: {dt:.2f}ms, tok/sec: {tokens_per_second:.2f}"
+        )
 
     sys.exit()
 
