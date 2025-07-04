@@ -62,7 +62,6 @@ class CausalSelfAttention(nn.Module):
         att = (q @ k.transpose(-2, -1)) * (1 / math.sqrt(k.size(-1)))
         att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
         y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = (
             y.transpose(1, 2).contiguous().view(B, T, C)
@@ -215,16 +214,18 @@ if __name__ == "__main__":
     print(model)
 
     import tiktoken
+    from transformers import set_seed
 
     enc = tiktoken.get_encoding("gpt2")
-    token = enc.encode("Hello, I'm a language model")
+    token = enc.encode("Hello, I'm a language model,")
     tokens = torch.tensor(token, dtype=torch.long)  # (8,)
     tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)  # (5, 8)
     x = tokens.to(device)
 
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-    torch.mps.manual_seed(42)
+    # torch.manual_seed(42)
+    # torch.cuda.manual_seed(42)
+    # torch.mps.manual_seed(42)
+    set_seed(42)
 
     while x.size(1) < max_length:
         # forward the model to get the logits for the next token
@@ -247,3 +248,8 @@ if __name__ == "__main__":
 
             # append the sampled indices to the running sequence
             x = torch.cat((x, xcol), dim=1)
+
+    for i in range(num_return_sequences):
+        token = x[i, :max_length].tolist()
+        decoded = enc.decode(token)
+        print(">", decoded)
