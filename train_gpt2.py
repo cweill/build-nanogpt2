@@ -30,6 +30,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
         # regularization
         self.n_head = config.n_head
@@ -80,6 +81,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate="tanh")
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -117,6 +119,31 @@ class GPT(nn.Module):
             )
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init params
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02  # roughly equivalent to 1/sqrt(d_model)
+            if hasattr(module, "NANOGPT_SCALE_INIT"):
+                std *= (2 * self.config.n_layer) ** -0.05
+            torch.nn.init.normal_(
+                module.weight,
+                mean=0.0,
+                std=std,
+            )
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(
+                module.weight,
+                mean=0.0,
+                std=0.02,  # roughly equivalent to 1/sqrt(d_model)
+            )
 
     def forward(self, idx, targets=None):
         # idx and targets are both (B, T) tensor of integers token indices
@@ -204,7 +231,7 @@ class GPT(nn.Module):
 
 
 class DataLoaderLite:
-    def __init__(self, B, T, device):
+    def __init__(self, B, T):
         self.B = B
         self.T = T
 
@@ -213,7 +240,7 @@ class DataLoaderLite:
             text = f.read()
         enc = tiktoken.get_encoding("gpt2")
         tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens, dtype=torch.long, device=device)
+        self.tokens = torch.tensor(tokens, dtype=torch.long)
         print(f"loaded {len(tokens)} tokens")
         print(f"1 epoch = {len(tokens) // (B * T)} batches")
 
@@ -248,15 +275,7 @@ def main():
     )
     print(f"Using device: {device}")
 
-    enc = tiktoken.get_encoding("gpt2")
-    with open("input.txt", "r") as f:
-        text = f.read()
-    text = text[:1000]
-    tokens = enc.encode(text)
-    B, T = 4, 32
-    buf = torch.tensor(tokens[: B * T + 1], dtype=torch.long, device=device)
-    x = buf[:-1].view(B, T)
-    y = buf[1:].view(B, T)
+    train_loader = DataLoaderLite(B=4, T=32)
 
     # model = GPT.from_pretrained("gpt2")
     model = GPT(GPTConfig())
@@ -268,6 +287,8 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     for i in range(50):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
         logits, loss = model(x, y)
         loss.backward()
