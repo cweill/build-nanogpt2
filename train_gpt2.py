@@ -1,7 +1,6 @@
-import code
 import inspect
 import math
-import sys
+import os
 import time
 from dataclasses import dataclass
 
@@ -250,20 +249,28 @@ class GPT(nn.Module):
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        print(
+            f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters"
+        )
+        print(
+            f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters"
+        )
         # Create AdamW optimizer and use the fused version if it is available and on an CUDA device
         fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == "cuda"
         print(f"using fused AdamW: {use_fused}")
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, fused=use_fused, betas=(0.9, 0.95), eps=1e-8)
+        optimizer = torch.optim.AdamW(
+            optim_groups, lr=learning_rate, fused=use_fused, betas=(0.9, 0.95), eps=1e-8
+        )
         return optimizer
 
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
 
         # at init load tokens from disk and store them in memory
         with open("input.txt", "r") as f:
@@ -275,30 +282,55 @@ class DataLoaderLite:
         print(f"1 epoch = {len(tokens) // (B * T)} batches")
 
         # state
-        self.current_position = 0
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
         buf = self.tokens[self.current_position : self.current_position + B * T + 1]
-        x = buf[:-1].view(B, T)
-        y = buf[1:].view(B, T)
-        self.current_position += B * T
+        x = buf[:-1].view(B, T)  # inputs
+        y = buf[1:].view(B, T)  # targets
+        # advance the position in the tensor
+        self.current_position += B * T * self.num_processes
         # if loading the next batch would be out of bounds, reset the position
-        if self.current_position + (B * T + 1) > len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
         return x, y
 
 
-def main():
-    NUM_RETURN_SEQUENCES = 5
-    MAX_LENGTH = 30
-
-    torch.manual_seed(1337)
-    torch.cuda.manual_seed(1337)
-    torch.mps.manual_seed(1337)
-    set_seed(1337)
+# ------------------------------------------------------------
+# simple launch:
+# python train_gpt2.py
+# DDP launch for e.g. 8 GPUs:
+# torchrun --standalone --nproc_per_node=8 train_gpt2.py
 
 
+NUM_RETURN_SEQUENCES = 5
+MAX_LENGTH = 30
+
+# run the training loop
+from torch.distributed import destroy_process_group, init_process_group
+
+# set up DDP (distributed data parallel).
+# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "DDP requires CUDA"
+    init_process_group(backend="nccl")
+    ddp_rank = int(os.environ["RANK"])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    device = torch.device(f"cuda:{ddp_local_rank}")
+    torch.cuda.set_device(device)
+    master_process = (
+        ddp_rank == 0
+    )  # only the first process will do logging, checkpointing etc.
+else:
+    # vanilla non-distributed training
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
     device = torch.device(
         "cuda"
         if torch.cuda.is_available()
@@ -306,110 +338,123 @@ def main():
     )
     print(f"Using device: {device}")
 
-    total_batch_size = 524_288 # 2**19, ~0.5M in number of tokens
-    B = 16 # micro batch size
-    T = 1024 # sequence length
-    assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by (B * T)"
-    grad_accum_steps = total_batch_size // (B * T)
+torch.manual_seed(1337)
+torch.cuda.manual_seed(1337)
+torch.mps.manual_seed(1337)
+set_seed(1337)
+
+total_batch_size = 524_288  # 2**19, ~0.5M in number of tokens
+B = 16  # micro batch size
+T = 1024  # sequence length
+assert (
+    total_batch_size % (B * T * ddp_world_size) == 0
+), "make sure total_batch_size is divisible by (B * T * ddp_world_size)"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
     print(f"total desired batch size: {total_batch_size:,}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps:,}")
 
-    train_loader = DataLoaderLite(B=B, T=T)
+train_loader = DataLoaderLite(
+    B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size
+)
 
-    torch.set_float32_matmul_precision("high")
+torch.set_float32_matmul_precision("high")
 
-    # model = GPT.from_pretrained("gpt2")
-    model = GPT(GPTConfig(vocab_size=50304))
-    model.eval()
-    model.to(device)
-    model = torch.compile(model)
+# create model
+model = GPT(GPTConfig(vocab_size=50304))
+model.to(device)
+model = torch.compile(model)
+if ddp:
+    model = torch.nn.parallel.DistributedDataParallel(
+        model, device_ids=[ddp_local_rank]
+    )
 
-    max_lr = 6e-4
-    min_lr = max_lr * 0.1
-    warmup_steps = 10
-    max_steps = 50
-
-    def get_lr(it):
-        # 1) linear warmup for warmup_steps
-        if it < warmup_steps:
-            return max_lr * (it+1) / warmup_steps
-        # 2) if it > lr_decay_steps, return min_lr
-        if it > max_steps:
-            return min_lr
-        # 3) in between, use cosine decay down to min_lr
-        decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-        assert 0 <= decay_ratio <= 1
-        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
-        return min_lr + coeff * (max_lr - min_lr)
-
-    # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
-    for step in range(50):
-        t0 = time.time()
-        optimizer.zero_grad()
-        loss_accum = 0
-        for micro_step in range(grad_accum_steps):
-            x, y = train_loader.next_batch()
-            x, y = x.to(device), y.to(device)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                logits, loss = model(x, y)
-            # we have to scale the loss to account for gradient accumulation,
-            # because the gradients just add on each successive backward().
-            # addition of gradients corresponds to a SUM in the objective, but
-            # instead of a SUM we want MEAN. Scale the loss here so it comes out right.
-            loss = loss / grad_accum_steps
-            loss_accum += loss.detach()
-            loss.backward()
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        # detemine the learning rate for this step
-        lr = get_lr(step)
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
-        optimizer.step()
-        torch.cuda.synchronize()
-        t1 = time.time()
-        dt = (t1 - t0) * 1000  # ms
-        tokens_processed = (train_loader.B * train_loader.T) * grad_accum_steps
-        tokens_per_second = tokens_processed / (t1 - t0)
-        print(
-            f"Step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | time: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}"
-        )
-
-    sys.exit()
-
-    # enc = tiktoken.get_encoding("gpt2")
-    # token = enc.encode("Hello, I'm a language model,")
-    # tokens = torch.tensor(token, dtype=torch.long)  # (8,)
-    # tokens = tokens.unsqueeze(0).repeat(NUM_RETURN_SEQUENCES, 1)  # (5, 8)
-    # x = tokens.to(device)
-
-    # while x.size(1) < MAX_LENGTH:
-    #     # forward the model to get the logits for the next token
-
-    #     with torch.no_grad():
-    #         logits = model(x)
-    #         # take the logits at the last position
-    #         logits = logits[:, -1, :]
-    #         # get the probabilities
-    #         probs = F.softmax(logits, dim=-1)
-    #         # do top-k sampling of 50 (huggingface pipeline default)
-    #         # topk_probs here becomes (5, 50), topk_indices becomes (5, 50)
-    #         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-
-    #         # select a token from the top-k probabilities
-    #         ix = torch.multinomial(topk_probs, 1)
-
-    #         # gather the indices of the top 50 tokens
-    #         xcol = torch.gather(topk_indices, -1, ix)
-
-    #         # append the sampled indices to the running sequence
-    #         x = torch.cat((x, xcol), dim=1)
-
-    # for i in range(NUM_RETURN_SEQUENCES):
-    #     token = x[i, :MAX_LENGTH].tolist()
-    #     decoded = enc.decode(token)
-    #     print(">", decoded)
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
 
 
-if __name__ == "__main__":
-    main()
+def get_lr(it):
+    # 1) linear warmup for warmup_steps
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+    # 2) if it > lr_decay_steps, return min_lr
+    if it > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min_lr
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (
+        1.0 + math.cos(math.pi * decay_ratio)
+    )  # coeff starts at 1 and goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
+
+
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizers(
+    weight_decay=0.1, learning_rate=6e-4, device_type=device.type
+)
+for step in range(50):
+    t0 = time.time()
+    optimizer.zero_grad()
+    loss_accum = 0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        # we have to scale the loss to account for gradient accumulation,
+        # because the gradients just add on each successive backward().
+        # addition of gradients corresponds to a SUM in the objective, but
+        # instead of a SUM we want MEAN. Scale the loss here so it comes out right.
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # detemine the learning rate for this step
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+    optimizer.step()
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000  # ms
+    tokens_processed = (train_loader.B * train_loader.T) * grad_accum_steps
+    tokens_per_second = tokens_processed / (t1 - t0)
+    print(
+        f"Step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | time: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}"
+    )
+
+# enc = tiktoken.get_encoding("gpt2")
+# token = enc.encode("Hello, I'm a language model,")
+# tokens = torch.tensor(token, dtype=torch.long)  # (8,)
+# tokens = tokens.unsqueeze(0).repeat(NUM_RETURN_SEQUENCES, 1)  # (5, 8)
+# x = tokens.to(device)
+
+# while x.size(1) < MAX_LENGTH:
+#     # forward the model to get the logits for the next token
+
+#     with torch.no_grad():
+#         logits = model(x)
+#         # take the logits at the last position
+#         logits = logits[:, -1, :]
+#         # get the probabilities
+#         probs = F.softmax(logits, dim=-1)
+#         # do top-k sampling of 50 (huggingface pipeline default)
+#         # topk_probs here becomes (5, 50), topk_indices becomes (5, 50)
+#         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+
+#         # select a token from the top-k probabilities
+#         ix = torch.multinomial(topk_probs, 1)
+
+#         # gather the indices of the top 50 tokens
+#         xcol = torch.gather(topk_indices, -1, ix)
+
+#         # append the sampled indices to the running sequence
+#         x = torch.cat((x, xcol), dim=1)
+
+# for i in range(NUM_RETURN_SEQUENCES):
+#     token = x[i, :MAX_LENGTH].tolist()
+#     decoded = enc.decode(token)
+#     print(">", decoded)
