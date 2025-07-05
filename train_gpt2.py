@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.distributed import destroy_process_group, dist, init_process_group
 from torch.utils.data import DataLoader, Dataset
 from transformers import GPT2LMHeadModel, set_seed
 
@@ -308,7 +309,6 @@ NUM_RETURN_SEQUENCES = 5
 MAX_LENGTH = 30
 
 # run the training loop
-from torch.distributed import destroy_process_group, init_process_group
 
 # set up DDP (distributed data parallel).
 # torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
@@ -368,6 +368,7 @@ if ddp:
     model = torch.nn.parallel.DistributedDataParallel(
         model, device_ids=[ddp_local_rank]
     )
+raw_model = model.module if ddp else model  # always contains the "raw" unwrapped model
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -392,7 +393,7 @@ def get_lr(it):
 
 
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-optimizer = model.configure_optimizers(
+optimizer = raw_model.configure_optimizers(
     weight_decay=0.1, learning_rate=6e-4, device_type=device.type
 )
 for step in range(50):
@@ -410,7 +411,11 @@ for step in range(50):
         # instead of a SUM we want MEAN. Scale the loss here so it comes out right.
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
         loss.backward()
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # detemine the learning rate for this step
     lr = get_lr(step)
@@ -422,10 +427,15 @@ for step in range(50):
     dt = (t1 - t0) * 1000  # ms
     tokens_processed = (train_loader.B * train_loader.T) * grad_accum_steps
     tokens_per_second = tokens_processed / (t1 - t0)
-    print(
-        f"Step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | time: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}"
-    )
+    if master_process:
+        print(
+            f"Step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | time: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}"
+        )
 
+if ddp:
+    destroy_process_group()
+
+# model.eval()
 # enc = tiktoken.get_encoding("gpt2")
 # token = enc.encode("Hello, I'm a language model,")
 # tokens = torch.tensor(token, dtype=torch.long)  # (8,)
