@@ -1,4 +1,5 @@
 # Inspired by https://medium.com/@lou1swang/lets-reproduce-nanogpt-with-jax-part-1-95bec4630eb4
+import os
 import time
 from dataclasses import dataclass
 from typing import Tuple
@@ -11,6 +12,14 @@ from flax import linen as nn
 from flax.core.frozen_dict import FrozenDict
 from flax.training.train_state import TrainState
 
+os.environ["XLA_FLAGS"] = (
+    # "--xla_gpu_enable_triton_softmax_fusion=true "
+    "--xla_gpu_triton_gemm_any=True "
+    # "--xla_gpu_enable_async_collectives=true "
+    "--xla_gpu_enable_latency_hiding_scheduler=true "
+    "--xla_gpu_enable_highest_priority_async_stream=true "
+)
+
 
 @dataclass
 class ModelConfig:
@@ -21,6 +30,7 @@ class ModelConfig:
     n_layer: int = 12  # number of layers
     n_head: int = 12  # number of attention heads
     n_embd: int = 768  # embedding dimension
+    dtype: jnp.dtype = jnp.float32
 
 
 class CausalSelfAttention(nn.Module):
@@ -35,23 +45,33 @@ class CausalSelfAttention(nn.Module):
         b, l, d = x.shape
 
         q = nn.Dense(
-            self.config.n_embd, kernel_init=nn.initializers.normal(stddev=0.02)
+            self.config.n_embd,
+            kernel_init=nn.initializers.normal(stddev=0.02),
+            dtype=self.config.dtype,
         )(x)
         k = nn.Dense(
-            self.config.n_embd, kernel_init=nn.initializers.normal(stddev=0.02)
+            self.config.n_embd,
+            kernel_init=nn.initializers.normal(stddev=0.02),
+            dtype=self.config.dtype,
         )(x)
         v = nn.Dense(
-            self.config.n_embd, kernel_init=nn.initializers.normal(stddev=0.02)
+            self.config.n_embd,
+            kernel_init=nn.initializers.normal(stddev=0.02),
+            dtype=self.config.dtype,
         )(x)
         # q*k / sqrt(dim) -> softmax -> @v
-        q = jnp.reshape(q, (b, l, d // self.config.n_head, self.config.n_head))
-        k = jnp.reshape(k, (b, l, d // self.config.n_head, self.config.n_head))
+        q = jnp.reshape(q, (b, l, d // self.config.n_head, self.config.n_head)).astype(
+            jnp.float32
+        )
+        k = jnp.reshape(k, (b, l, d // self.config.n_head, self.config.n_head)).astype(
+            jnp.float32
+        )
         v = jnp.reshape(v, (b, l, d // self.config.n_head, self.config.n_head))
         norm = jnp.sqrt(list(jnp.shape(k))[-1])
         attn = jnp.matmul(q, jnp.transpose(k, (0, 1, 3, 2))) / norm
         mask = jnp.tril(attn)
-        attn = jnp.where(mask[:, :, :l, :l], attn, float("-inf"))
-        probs = jax.nn.softmax(attn, axis=-1)
+        attn = jnp.where(mask[:, :, :l, :l], attn, float("-inf")).astype(jnp.float32)
+        probs = jax.nn.softmax(attn, axis=-1).astype(self.config.dtype)
         y = jnp.matmul(probs, v)
         y = jnp.reshape(y, (b, l, d))
         y = nn.Dense(
@@ -59,7 +79,7 @@ class CausalSelfAttention(nn.Module):
             kernel_init=nn.initializers.normal(
                 stddev=0.02 * (2 * self.config.n_layer) ** -0.05
             ),
-        )(y)
+        )(y).astype(self.config.dtype)
         return y
 
 
@@ -70,7 +90,9 @@ class MLP(nn.Module):
     @nn.compact
     def __call__(self, x, deterministic=True):
         x = nn.Dense(
-            self.config.n_embd * 4, kernel_init=nn.initializers.normal(stddev=0.02)
+            self.config.n_embd * 4,
+            kernel_init=nn.initializers.normal(stddev=0.02),
+            # dtype=self.config.dtype,
         )(x)
         x = nn.gelu(x, approximate=True)
         x = nn.Dense(
@@ -78,6 +100,7 @@ class MLP(nn.Module):
             kernel_init=nn.initializers.normal(
                 stddev=0.02 * (2 * self.config.n_layer) ** -0.05
             ),
+            # dtype=self.config.dtype,
         )(x)
         return x
 
@@ -131,7 +154,10 @@ def count_params(params):
 
 config = ModelConfig()
 key = jax.random.PRNGKey(0)
-model = GPT(config)
+# model = GPT(config)
+model = nn.remat(
+    GPT, policy=jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims
+)(config)
 params = model.init(key)
 print(f"Number of parameters: {count_params(params):,}")
 
@@ -159,10 +185,27 @@ class DataLoader:
         return x, y
 
 
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+
+
 def init_train_state(key, config) -> TrainState:
     model = GPT(config)
     params = model.init(key)
     optimizer = optax.adamw(3e-4, b1=0.9, b2=0.98, eps=1e-9, weight_decay=1e-1)
+    learning_rate = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=max_lr,
+        warmup_steps=warmup_steps,
+        decay_steps=max_steps,
+        end_value=min_lr,
+    )
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(learning_rate, b1=0.9, b2=0.95, weight_decay=1e-1),
+    )
     train_state = TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
     return train_state
 
