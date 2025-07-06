@@ -6,10 +6,11 @@ from dataclasses import dataclass
 
 import tiktoken
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.distributed import destroy_process_group, dist, init_process_group
+from torch.distributed import destroy_process_group, init_process_group
 from torch.utils.data import DataLoader, Dataset
 from transformers import GPT2LMHeadModel, set_seed
 
@@ -344,7 +345,7 @@ torch.mps.manual_seed(1337)
 set_seed(1337)
 
 total_batch_size = 524_288  # 2**19, ~0.5M in number of tokens
-B = 16  # micro batch size
+B = 64  # micro batch size
 T = 1024  # sequence length
 assert (
     total_batch_size % (B * T * ddp_world_size) == 0
